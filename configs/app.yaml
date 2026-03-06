@@ -1,0 +1,34 @@
+app:
+  name: VideoToAssets
+  log_level: INFO
+  resume_enabled: true
+  keep_temp_audio: true
+
+subtitle:
+  language_priority:
+    - zh-Hans
+    - zh
+    - en
+  allow_auto_subtitles: true
+  min_valid_entries: 12
+  max_duplicate_line_ratio: 0.6
+
+asr:
+  model: large-v3
+  language: zh
+  device: auto
+  compute_type: auto
+  command_candidates:
+    - whisper-ctranslate2
+    - whisper
+  allow_placeholder_transcript: true
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+  temperature: 0.2
+  max_input_chars: 48000
+  use_mock_without_api_key: true
+
+external_tools:
+  yt_dlp_bin: yt-dlp
