@@ -13,6 +13,8 @@ VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
 @dataclass
 class OutputPaths:
     root: Path
+    source: Path
+    normalized: Path
     metadata: Path
     subtitles_raw: Path
     asr: Path
@@ -57,6 +59,8 @@ class PathManager:
         root = self.output_root / video_id
         return OutputPaths(
             root=root,
+            source=root / "source",
+            normalized=root / "normalized",
             metadata=root / "metadata",
             subtitles_raw=root / "subtitles_raw",
             asr=root / "asr",
@@ -73,14 +77,14 @@ class PathManager:
         )
 
     def ensure(self, video_id: str) -> OutputPaths:
-        paths = self.build(video_id)
-        for p in [
+        return self.ensure_source(video_id, include_video_dirs=True)
+
+    def ensure_source(self, source_id: str, include_video_dirs: bool = False) -> OutputPaths:
+        paths = self.build(source_id)
+        base_dirs = [
             paths.root,
-            paths.metadata,
-            paths.subtitles_raw,
-            paths.asr,
-            paths.subtitles_clean,
-            paths.text_exports,
+            paths.source,
+            paths.normalized,
             paths.llm_review,
             paths.summaries,
             paths.articles_wechat,
@@ -88,6 +92,16 @@ class PathManager:
             paths.highlights,
             paths.source_attribution,
             paths.logs,
-        ]:
+        ]
+        for p in base_dirs:
             p.mkdir(parents=True, exist_ok=True)
+        if include_video_dirs:
+            for p in [
+                paths.metadata,
+                paths.subtitles_raw,
+                paths.asr,
+                paths.subtitles_clean,
+                paths.text_exports,
+            ]:
+                p.mkdir(parents=True, exist_ok=True)
         return paths

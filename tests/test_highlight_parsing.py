@@ -28,3 +28,13 @@ def test_highlight_json_roundtrip(tmp_path: Path):
     assert len(parsed) <= 10
     assert all(item.score >= 30 for item in parsed)
     assert out["clip_plan"].exists()
+
+
+def test_highlight_paragraph_mode(tmp_path: Path):
+    miner = HighlightMiner()
+    text = "第一段落内容，包含一些可传播的观点和建议。\n\n第二段落继续补充细节与步骤。"
+    out = miner.run_from_canonical("text", text, tmp_path / "highlights")
+    parsed = miner.parse_candidates_file(out["top10_final"])
+    assert parsed
+    assert parsed[0].start is None
+    assert parsed[0].paragraph_id is not None

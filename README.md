@@ -1,6 +1,6 @@
 # VideoToAssets (Round 2)
 
-VideoToAssets 将单个视频 URL 加工为结构化内容资产，输出到 `data/outputs/{video_id}/`。
+VideoToAssets 支持单个视频 URL / 文本 / 文件输入，输出结构化内容资产到 `data/outputs/{source_id}/`。
 
 ## 当前能力
 - 抓取视频 metadata
@@ -39,9 +39,21 @@ BAILIAN_API_KEY=你的key
 VIDEO_TO_ASSETS_LLM_BASE_URL=https://coding.dashscope.aliyuncs.com/v1
 VIDEO_TO_ASSETS_USE_MOCK_LLM=false
 ```
-3. 运行（全量）：
+3. 运行（全量，视频）：
 ```bash
 python scripts/run_single.py --url "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+文本输入：
+```bash
+python scripts/run_single.py --input-type text --text "这里是一段文字" --tasks summary
+```
+文本文件输入：
+```bash
+python scripts/run_single.py --input-type text --text-file "data/inbox/demo.txt" --tasks all
+```
+文件输入（txt/md/srt/vtt/json）：
+```bash
+python scripts/run_single.py --input-type file --file "data/inbox/demo.srt" --tasks all
 ```
 4. 按任务执行（增量）：
 ```bash
@@ -53,10 +65,12 @@ PYTHONPATH=src python -m video_to_assets.cli run --url "https://www.youtube.com/
 ```
 
 ## 输出目录
-每次单视频输出在：
-`data/outputs/{video_id}/`
+每次输出在：
+`data/outputs/{source_id}/`
 
 包含：
+- `source/`
+- `normalized/`
 - `metadata/`
 - `subtitles_raw/`
 - `asr/`

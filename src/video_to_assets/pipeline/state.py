@@ -12,6 +12,10 @@ class PipelineState:
     url: str
     video_id: str
     paths: OutputPaths
+    input_type: str = "video"
+    source_type: str = "video"
+    source_id: str | None = None
+    source_metadata_complete: bool = True
     tasks: set[str] = field(default_factory=set)
     metadata: VideoInfo | None = None
     subtitle_source: str = "none"

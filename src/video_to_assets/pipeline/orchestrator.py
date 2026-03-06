@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 
 from video_to_assets.asr.whisper_runner import WhisperRunner
+from video_to_assets.canonical.canonical_content import CanonicalContent, TimestampSegment
+from video_to_assets.canonical.normalizer import build_canonical
+from video_to_assets.canonical.writer import write_canonical_outputs
 from video_to_assets.collectors.audio_fetcher import AudioFetcher
 from video_to_assets.collectors.subtitle_fetcher import SubtitleFetcher
 from video_to_assets.collectors.video_metadata import VideoMetadataCollector
@@ -12,7 +15,9 @@ from video_to_assets.config import load_config
 from video_to_assets.llm.client import LLMClient
 from video_to_assets.llm.quality_review import QualityReviewer
 from video_to_assets.llm.transcript_polisher import TranscriptPolisher
+from video_to_assets.models.source_input import SourceInput
 from video_to_assets.models.video_info import VideoInfo
+from video_to_assets.pipeline.source_router import SourceRouter
 from video_to_assets.pipeline.stages import StageName
 from video_to_assets.pipeline.state import PipelineState
 from video_to_assets.pipeline.task_router import (
@@ -56,9 +61,17 @@ class Orchestrator:
         logger = setup_logger(paths.logs / "pipeline.log", self.config.log_level)
         runner = CommandRunner(logger=logger)
         registry = OutputRegistry(paths.logs / "stage_status.json")
-        registry.set_context(url=url, video_id=video_id, tasks=sorted(selected_tasks))
+        registry.set_context(url=url, video_id=video_id, tasks=sorted(selected_tasks), input_type="video", source_type="video", source_id=video_id)
 
-        state = PipelineState(url=url, video_id=video_id, paths=paths, tasks=selected_tasks)
+        state = PipelineState(
+            url=url,
+            video_id=video_id,
+            paths=paths,
+            tasks=selected_tasks,
+            input_type="video",
+            source_type="video",
+            source_id=video_id,
+        )
 
         adapter = YtDlpAdapter(self.config, runner)
         metadata_collector = VideoMetadataCollector(adapter, logger=logger)
@@ -111,11 +124,33 @@ class Orchestrator:
             logger=logger,
         )
 
+        canonical = self._run_canonical_stage_for_video(
+            state=state,
+            resume=resume,
+            registry=registry,
+            cleaned_plain=cleaned_plain,
+            cleaned_json=cleaned_json,
+            logger=logger,
+        )
+        if canonical:
+            state.source_id = canonical.source_id
+            state.source_type = canonical.source_type
+            state.source_metadata_complete = self._metadata_complete(canonical)
+            registry.set_context(
+                source_id=state.source_id,
+                source_type=state.source_type,
+                source_metadata_complete=state.source_metadata_complete,
+            )
+
+        cleaned_plain_for_tasks = paths.normalized / "clean_text.txt"
+        if not cleaned_plain_for_tasks.exists():
+            cleaned_plain_for_tasks = cleaned_plain
+
         # Keep round1 llm outputs available for complete asset package.
         self._run_round1_llm(
             resume=resume,
             registry=registry,
-            cleaned_plain=cleaned_plain,
+            cleaned_plain=cleaned_plain_for_tasks,
             quality_reviewer=quality_reviewer,
             polisher=polisher,
             llm_review_dir=paths.llm_review,
@@ -123,13 +158,13 @@ class Orchestrator:
         )
 
         # -------- Round 2 tasks --------
-        has_min_inputs = cleaned_plain.exists() and cleaned_json.exists()
+        has_min_inputs = cleaned_plain_for_tasks.exists()
 
         if should_run(selected_tasks, TASK_SUMMARY):
             try:
                 registry.stage_start(StageName.SUMMARIES.value)
                 if not has_min_inputs:
-                    raise RuntimeError("summary requires cleaned_plain.txt and cleaned.json")
+                    raise RuntimeError("summary requires cleaned text")
                 if resume and (paths.summaries / "executive_summary.md").exists():
                     registry.stage_success(
                         StageName.SUMMARIES.value,
@@ -137,7 +172,7 @@ class Orchestrator:
                         notes="resume_hit",
                     )
                 else:
-                    summary_outputs = summary_generator.run(cleaned_plain, paths.summaries)
+                    summary_outputs = summary_generator.run(cleaned_plain_for_tasks, paths.summaries)
                     registry.stage_success(StageName.SUMMARIES.value, outputs=[str(x) for x in summary_outputs.values()])
             except Exception as exc:
                 logger.exception("summaries stage failed")
@@ -146,8 +181,8 @@ class Orchestrator:
         if should_run(selected_tasks, TASK_SUMMARY) or should_run(selected_tasks, TASK_WECHAT):
             try:
                 registry.stage_start(StageName.SOURCE_ATTRIBUTION.value)
-                if not cleaned_plain.exists():
-                    raise RuntimeError("source attribution requires cleaned_plain.txt")
+                if not cleaned_plain_for_tasks.exists():
+                    raise RuntimeError("source attribution requires cleaned text")
                 if resume and (paths.source_attribution / "source_profile.json").exists():
                     registry.stage_success(
                         StageName.SOURCE_ATTRIBUTION.value,
@@ -155,7 +190,9 @@ class Orchestrator:
                         notes="resume_hit",
                     )
                 else:
-                    source_outputs = source_builder.run(state.metadata, cleaned_plain, paths.source_attribution)
+                    if canonical is None:
+                        raise RuntimeError("source attribution requires canonical content")
+                    source_outputs = source_builder.run(canonical, cleaned_plain_for_tasks, paths.source_attribution)
                     registry.stage_success(StageName.SOURCE_ATTRIBUTION.value, outputs=[str(x) for x in source_outputs.values()])
             except Exception as exc:
                 logger.exception("source attribution stage failed")
@@ -164,8 +201,8 @@ class Orchestrator:
         if should_run(selected_tasks, TASK_WECHAT):
             try:
                 registry.stage_start(StageName.WECHAT.value)
-                if not cleaned_plain.exists():
-                    raise RuntimeError("wechat requires cleaned_plain.txt")
+                if not cleaned_plain_for_tasks.exists():
+                    raise RuntimeError("wechat requires cleaned text")
                 summary_file = paths.summaries / "executive_summary.md"
                 source_profile_file = paths.source_attribution / "source_profile.json"
                 if resume and (paths.articles_wechat / "article_01.md").exists() and (paths.articles_wechat / "article_03.md").exists():
@@ -176,11 +213,13 @@ class Orchestrator:
                     )
                 else:
                     wechat_outputs = wechat_generator.run(
-                        cleaned_plain_file=cleaned_plain,
+                        cleaned_plain_file=cleaned_plain_for_tasks,
                         summary_file=summary_file,
                         source_profile_file=source_profile_file,
                         output_dir=paths.articles_wechat,
                         metadata=state.metadata,
+                        source_title=canonical.title if canonical else None,
+                        source_type=canonical.source_type if canonical else None,
                     )
                     registry.stage_success(StageName.WECHAT.value, outputs=[str(x) for x in wechat_outputs.values()])
             except Exception as exc:
@@ -190,8 +229,8 @@ class Orchestrator:
         if should_run(selected_tasks, TASK_XHS):
             try:
                 registry.stage_start(StageName.XHS.value)
-                if not cleaned_plain.exists():
-                    raise RuntimeError("xhs requires cleaned_plain.txt")
+                if not cleaned_plain_for_tasks.exists():
+                    raise RuntimeError("xhs requires cleaned text")
                 if resume and (paths.articles_xiaohongshu / "xhs_01.md").exists() and (paths.articles_xiaohongshu / "xhs_05.md").exists():
                     registry.stage_success(
                         StageName.XHS.value,
@@ -199,7 +238,14 @@ class Orchestrator:
                         notes="resume_hit",
                     )
                 else:
-                    xhs_outputs = xhs_generator.run(cleaned_plain, paths.articles_xiaohongshu, state.metadata)
+                    xhs_outputs = xhs_generator.run(
+                        cleaned_plain_for_tasks,
+                        paths.articles_xiaohongshu,
+                        state.metadata,
+                        source_profile_file=paths.source_attribution / "source_profile.json",
+                        source_title=canonical.title if canonical else None,
+                        source_type=canonical.source_type if canonical else None,
+                    )
                     registry.stage_success(StageName.XHS.value, outputs=[str(x) for x in xhs_outputs.values()])
             except Exception as exc:
                 logger.exception("xhs stage failed")
@@ -217,13 +263,195 @@ class Orchestrator:
                         notes="resume_hit",
                     )
                 else:
-                    highlight_outputs = highlight_miner.run(cleaned_json, paths.highlights)
+                    highlight_outputs = highlight_miner.run(cleaned_json, paths.highlights, source_type="video")
                     registry.stage_success(StageName.HIGHLIGHTS.value, outputs=[str(x) for x in highlight_outputs.values()])
             except Exception as exc:
                 logger.exception("highlights stage failed")
                 registry.stage_failed(StageName.HIGHLIGHTS.value, str(exc))
 
         # per-video readme / asset index
+        try:
+            registry.stage_start(StageName.README.value)
+            readme_builder.build(state=state, stage_status=registry.data, output_file=paths.readme)
+            registry.stage_success(StageName.README.value, outputs=[str(paths.readme)])
+        except Exception as exc:
+            logger.exception("readme stage failed")
+            registry.stage_failed(StageName.README.value, str(exc))
+
+        return state
+
+    def run_source(self, source: SourceInput, resume: bool = True, tasks: list[str] | None = None) -> PipelineState:
+        if source.input_type == "video":
+            if not source.url:
+                raise ValueError("video input requires url")
+            return self.run(url=source.url, resume=resume, tasks=tasks)
+
+        selected_tasks = normalize_tasks(tasks)
+        path_manager = PathManager(self.config.output_root)
+        router = SourceRouter(self.config.output_root)
+        canonical = router.route(source)
+
+        paths = path_manager.ensure_source(canonical.source_id, include_video_dirs=False)
+        logger = setup_logger(paths.logs / "pipeline.log", self.config.log_level)
+        registry = OutputRegistry(paths.logs / "stage_status.json")
+        registry.set_context(
+            input_type=source.input_type,
+            source_type=canonical.source_type,
+            source_id=canonical.source_id,
+            tasks=sorted(selected_tasks),
+        )
+
+        state = PipelineState(
+            url=source.source_url or source.url or (str(source.file_path) if source.file_path else ""),
+            video_id=canonical.source_id,
+            paths=paths,
+            tasks=selected_tasks,
+            input_type=source.input_type,
+            source_type=canonical.source_type,
+            source_id=canonical.source_id,
+        )
+
+        registry.stage_start(StageName.INIT.value)
+        registry.stage_success(StageName.INIT.value, outputs=[str(paths.root)], notes=f"tasks={','.join(sorted(selected_tasks))}")
+
+        canonical = self._run_canonical_stage_for_source(
+            canonical=canonical,
+            source=source,
+            state=state,
+            resume=resume,
+            registry=registry,
+            logger=logger,
+        )
+        state.source_metadata_complete = self._metadata_complete(canonical)
+        registry.set_context(source_metadata_complete=state.source_metadata_complete)
+
+        cleaned_plain = paths.normalized / "clean_text.txt"
+
+        llm_client = LLMClient(self.config, logger=logger)
+        quality_reviewer = QualityReviewer(self.config, llm_client)
+        polisher = TranscriptPolisher(self.config, llm_client)
+        summary_generator = SummaryGenerator(self.config, llm_client)
+        source_builder = SourceProfileBuilder(self.config, llm_client)
+        wechat_generator = WechatArticleGenerator(self.config, llm_client)
+        xhs_generator = XiaohongshuPostGenerator(self.config, llm_client)
+        highlight_miner = HighlightMiner()
+        readme_builder = VideoReadmeBuilder()
+
+        self._run_round1_llm(
+            resume=resume,
+            registry=registry,
+            cleaned_plain=cleaned_plain,
+            quality_reviewer=quality_reviewer,
+            polisher=polisher,
+            llm_review_dir=paths.llm_review,
+            logger=logger,
+        )
+
+        if should_run(selected_tasks, TASK_SUMMARY):
+            try:
+                registry.stage_start(StageName.SUMMARIES.value)
+                if not cleaned_plain.exists():
+                    raise RuntimeError("summary requires cleaned text")
+                if resume and (paths.summaries / "executive_summary.md").exists():
+                    registry.stage_success(
+                        StageName.SUMMARIES.value,
+                        outputs=[str(paths.summaries / "executive_summary.md")],
+                        notes="resume_hit",
+                    )
+                else:
+                    summary_outputs = summary_generator.run(cleaned_plain, paths.summaries)
+                    registry.stage_success(StageName.SUMMARIES.value, outputs=[str(x) for x in summary_outputs.values()])
+            except Exception as exc:
+                logger.exception("summaries stage failed")
+                registry.stage_failed(StageName.SUMMARIES.value, str(exc))
+
+        if should_run(selected_tasks, TASK_SUMMARY) or should_run(selected_tasks, TASK_WECHAT):
+            try:
+                registry.stage_start(StageName.SOURCE_ATTRIBUTION.value)
+                if not cleaned_plain.exists():
+                    raise RuntimeError("source attribution requires cleaned text")
+                if resume and (paths.source_attribution / "source_profile.json").exists():
+                    registry.stage_success(
+                        StageName.SOURCE_ATTRIBUTION.value,
+                        outputs=[str(paths.source_attribution / "source_profile.json")],
+                        notes="resume_hit",
+                    )
+                else:
+                    source_outputs = source_builder.run(canonical, cleaned_plain, paths.source_attribution)
+                    registry.stage_success(StageName.SOURCE_ATTRIBUTION.value, outputs=[str(x) for x in source_outputs.values()])
+            except Exception as exc:
+                logger.exception("source attribution stage failed")
+                registry.stage_failed(StageName.SOURCE_ATTRIBUTION.value, str(exc))
+
+        if should_run(selected_tasks, TASK_WECHAT):
+            try:
+                registry.stage_start(StageName.WECHAT.value)
+                if not cleaned_plain.exists():
+                    raise RuntimeError("wechat requires cleaned text")
+                summary_file = paths.summaries / "executive_summary.md"
+                source_profile_file = paths.source_attribution / "source_profile.json"
+                if resume and (paths.articles_wechat / "article_01.md").exists() and (paths.articles_wechat / "article_03.md").exists():
+                    registry.stage_success(
+                        StageName.WECHAT.value,
+                        outputs=[str(paths.articles_wechat / "article_01.md"), str(paths.articles_wechat / "article_03.md")],
+                        notes="resume_hit",
+                    )
+                else:
+                    wechat_outputs = wechat_generator.run(
+                        cleaned_plain_file=cleaned_plain,
+                        summary_file=summary_file,
+                        source_profile_file=source_profile_file,
+                        output_dir=paths.articles_wechat,
+                        metadata=None,
+                        source_title=canonical.title,
+                        source_type=canonical.source_type,
+                    )
+                    registry.stage_success(StageName.WECHAT.value, outputs=[str(x) for x in wechat_outputs.values()])
+            except Exception as exc:
+                logger.exception("wechat stage failed")
+                registry.stage_failed(StageName.WECHAT.value, str(exc))
+
+        if should_run(selected_tasks, TASK_XHS):
+            try:
+                registry.stage_start(StageName.XHS.value)
+                if not cleaned_plain.exists():
+                    raise RuntimeError("xhs requires cleaned text")
+                if resume and (paths.articles_xiaohongshu / "xhs_01.md").exists() and (paths.articles_xiaohongshu / "xhs_05.md").exists():
+                    registry.stage_success(
+                        StageName.XHS.value,
+                        outputs=[str(paths.articles_xiaohongshu / "xhs_01.md"), str(paths.articles_xiaohongshu / "xhs_05.md")],
+                        notes="resume_hit",
+                    )
+                else:
+                    xhs_outputs = xhs_generator.run(
+                        cleaned_plain,
+                        paths.articles_xiaohongshu,
+                        None,
+                        source_profile_file=paths.source_attribution / "source_profile.json",
+                        source_title=canonical.title,
+                        source_type=canonical.source_type,
+                    )
+                    registry.stage_success(StageName.XHS.value, outputs=[str(x) for x in xhs_outputs.values()])
+            except Exception as exc:
+                logger.exception("xhs stage failed")
+                registry.stage_failed(StageName.XHS.value, str(exc))
+
+        if should_run(selected_tasks, TASK_HIGHLIGHTS):
+            try:
+                registry.stage_start(StageName.HIGHLIGHTS.value)
+                if resume and (paths.highlights / "top10_final.json").exists():
+                    registry.stage_success(
+                        StageName.HIGHLIGHTS.value,
+                        outputs=[str(paths.highlights / "top10_final.json")],
+                        notes="resume_hit",
+                    )
+                else:
+                    highlight_outputs = highlight_miner.run_from_canonical(canonical.source_type, canonical.raw_text, paths.highlights)
+                    registry.stage_success(StageName.HIGHLIGHTS.value, outputs=[str(x) for x in highlight_outputs.values()])
+            except Exception as exc:
+                logger.exception("highlights stage failed")
+                registry.stage_failed(StageName.HIGHLIGHTS.value, str(exc))
+
         try:
             registry.stage_start(StageName.README.value)
             readme_builder.build(state=state, stage_status=registry.data, output_file=paths.readme)
@@ -381,6 +609,170 @@ class Orchestrator:
         except Exception as exc:
             logger.exception("llm polish stage failed")
             registry.stage_failed(StageName.LLM_POLISH.value, str(exc))
+
+    def _run_canonical_stage_for_video(
+        self,
+        state: PipelineState,
+        resume: bool,
+        registry: OutputRegistry,
+        cleaned_plain: Path,
+        cleaned_json: Path,
+        logger,
+    ) -> CanonicalContent | None:
+        canonical_json = state.paths.normalized / "canonical_content.json"
+        try:
+            registry.stage_start(StageName.CANONICAL.value)
+            if resume and canonical_json.exists():
+                canonical = self._load_canonical(canonical_json)
+                registry.stage_success(StageName.CANONICAL.value, outputs=[str(canonical_json)], notes="resume_hit")
+                return canonical
+            if not cleaned_plain.exists():
+                raise RuntimeError("canonical requires cleaned_plain.txt")
+
+            raw_text = cleaned_plain.read_text(encoding="utf-8", errors="ignore")
+            timestamps = self._load_timestamp_segments(cleaned_json) if cleaned_json.exists() else []
+            metadata_dict = state.metadata.to_dict() if state.metadata else {}
+            canonical = build_canonical(
+                source_id=state.video_id,
+                source_type="video",
+                title=state.metadata.title if state.metadata else "Video Content",
+                raw_text=raw_text,
+                language=None,
+                timestamps=timestamps,
+                source_metadata=metadata_dict,
+                attribution={
+                    "source_type": "video",
+                    "source_note": "derived from video pipeline outputs",
+                },
+                processing_flags={
+                    "subtitle_source": state.subtitle_source,
+                    "asr_triggered": state.asr_triggered,
+                    "asr_placeholder": state.asr_placeholder,
+                },
+            )
+
+            source_snapshot = self._build_video_snapshot(raw_text, metadata_dict)
+            input_info = self._build_input_info(
+                input_type="video",
+                source_url=state.url,
+                source_name=metadata_dict.get("uploader") or metadata_dict.get("channel"),
+                author=metadata_dict.get("uploader") or metadata_dict.get("channel"),
+                publish_date=metadata_dict.get("upload_date"),
+                platform="youtube",
+            )
+            outputs = write_canonical_outputs(canonical, state.paths.root, source_snapshot, input_info)
+            registry.stage_success(StageName.CANONICAL.value, outputs=[str(x) for x in outputs.values()])
+            return canonical
+        except Exception as exc:
+            logger.exception("canonical stage failed")
+            registry.stage_failed(StageName.CANONICAL.value, str(exc))
+            return None
+
+    def _run_canonical_stage_for_source(
+        self,
+        canonical: CanonicalContent,
+        source: SourceInput,
+        state: PipelineState,
+        resume: bool,
+        registry: OutputRegistry,
+        logger,
+    ) -> CanonicalContent:
+        canonical_json = state.paths.normalized / "canonical_content.json"
+        try:
+            registry.stage_start(StageName.CANONICAL.value)
+            if resume and canonical_json.exists():
+                registry.stage_success(StageName.CANONICAL.value, outputs=[str(canonical_json)], notes="resume_hit")
+                return canonical
+            source_snapshot = self._load_source_snapshot(source)
+            input_info = self._build_input_info(
+                input_type=source.input_type,
+                source_name=source.source_name,
+                source_url=source.source_url or source.url,
+                author=source.author,
+                publish_date=source.publish_date,
+                platform=source.platform,
+            )
+            outputs = write_canonical_outputs(canonical, state.paths.root, source_snapshot, input_info)
+            registry.stage_success(StageName.CANONICAL.value, outputs=[str(x) for x in outputs.values()])
+            return canonical
+        except Exception as exc:
+            logger.exception("canonical stage failed")
+            registry.stage_failed(StageName.CANONICAL.value, str(exc))
+            return canonical
+
+    def _load_canonical(self, path: Path) -> CanonicalContent:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        timestamps = [TimestampSegment(**seg) for seg in payload.get("timestamps", [])]
+        return CanonicalContent(
+            source_id=payload.get("source_id", "unknown"),
+            source_type=payload.get("source_type", "unknown"),
+            title=payload.get("title", "Untitled"),
+            raw_text=payload.get("raw_text", ""),
+            clean_text=payload.get("clean_text", ""),
+            language=payload.get("language"),
+            timestamps=timestamps,
+            source_metadata=payload.get("source_metadata") or {},
+            attribution=payload.get("attribution") or {},
+            structure_hints=payload.get("structure_hints") or {},
+            processing_flags=payload.get("processing_flags") or {},
+        )
+
+    def _load_timestamp_segments(self, cleaned_json: Path) -> list[TimestampSegment]:
+        payload = json.loads(cleaned_json.read_text(encoding="utf-8"))
+        segments = []
+        for seg in payload.get("segments", []):
+            text = str(seg.get("text", "")).strip()
+            if not text:
+                continue
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", start))
+            segments.append(TimestampSegment(start=start, end=end, text=text))
+        return segments
+
+    def _build_video_snapshot(self, raw_text: str, metadata: dict) -> str:
+        if metadata:
+            meta_json = json.dumps(metadata, ensure_ascii=False, indent=2)
+            return f"# Source Metadata\n{meta_json}\n\n# Transcript\n{raw_text}\n"
+        return raw_text
+
+    def _build_input_info(
+        self,
+        input_type: str,
+        source_name: str | None = None,
+        source_url: str | None = None,
+        author: str | None = None,
+        publish_date: str | None = None,
+        platform: str | None = None,
+    ) -> dict[str, str]:
+        info: dict[str, str] = {"input_type": input_type}
+        if source_name:
+            info["source_name"] = source_name
+        if source_url:
+            info["source_url"] = source_url
+        if author:
+            info["author"] = author
+        if publish_date:
+            info["publish_date"] = publish_date
+        if platform:
+            info["platform"] = platform
+        return info
+
+    def _load_source_snapshot(self, source: SourceInput) -> str:
+        if source.text:
+            return source.text
+        if source.file_path:
+            try:
+                return Path(source.file_path).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                return ""
+        return ""
+
+    def _metadata_complete(self, canonical: CanonicalContent) -> bool:
+        if canonical.source_type == "video":
+            required = ["video_id", "title", "webpage_url"]
+        else:
+            required = ["source_name", "source_url"]
+        return all(canonical.source_metadata.get(key) for key in required)
 
     def _load_metadata(self, metadata_json: Path, fallback_video_id: str) -> VideoInfo:
         metadata_dict = json.loads(metadata_json.read_text(encoding="utf-8"))

@@ -9,6 +9,7 @@ class StageName(str, Enum):
     SUBTITLES = "subtitles"
     ASR = "asr"
     CLEAN_EXPORT = "clean_export"
+    CANONICAL = "canonical"
     LLM_REVIEW = "llm_review"
     LLM_POLISH = "llm_polish"
     SUMMARIES = "summaries"

@@ -19,6 +19,8 @@ class WechatArticleGenerator:
         source_profile_file: Path,
         output_dir: Path,
         metadata: VideoInfo | None,
+        source_title: str | None = None,
+        source_type: str | None = None,
     ) -> dict[str, Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -26,11 +28,12 @@ class WechatArticleGenerator:
         titles = self._generate_titles(base_content)
 
         outputs: dict[str, Path] = {}
+        source_context = self._resolve_source_context(source_profile_file, metadata, source_title, source_type)
         for idx in range(1, 4):
             article_path = output_dir / f"article_{idx:02d}.md"
             title = titles[idx - 1] if idx - 1 < len(titles) else f"文章方案 {idx}"
             body = self._generate_article(base_content, idx, title)
-            source_line = f"\n\n> 来源说明：本文基于视频《{metadata.title if metadata else '未知标题'}》转写内容整理。\n"
+            source_line = f"\n\n> 来源说明：{source_context['note']}\n"
             article_path.write_text(f"# {title}\n\n{body}{source_line}", encoding="utf-8")
             outputs[f"article_{idx:02d}"] = article_path
 
@@ -40,7 +43,7 @@ class WechatArticleGenerator:
         source_file = output_dir / "article_sources.md"
         source_file.write_text(
             "# Article Sources\n\n"
-            "- Base transcript: `subtitles_clean/cleaned_plain.txt`\n"
+            "- Base content: `normalized/clean_text.txt`\n"
             "- Summary layer: `summaries/executive_summary.md`\n"
             "- Source profile: `source_attribution/source_profile.json`\n"
             "- 注意：文章内容为衍生整理，不可冒充原始一手观点。\n",
@@ -87,17 +90,51 @@ class WechatArticleGenerator:
             )
         return body
 
+    def _resolve_source_context(
+        self,
+        source_profile_file: Path,
+        metadata: VideoInfo | None,
+        source_title: str | None,
+        source_type: str | None,
+    ) -> dict[str, str]:
+        profile = {}
+        if source_profile_file.exists():
+            try:
+                import json
+
+                profile = json.loads(source_profile_file.read_text(encoding="utf-8"))
+            except Exception:
+                profile = {}
+        resolved_type = source_type or profile.get("source_type") or ("video" if metadata else "text")
+        resolved_title = source_title or (metadata.title if metadata else None) or profile.get("title") or "未知标题"
+        if resolved_type == "video":
+            note = f"本文基于视频《{resolved_title}》转写内容整理，非原视频作者新发布观点。"
+        elif resolved_type == "file":
+            note = f"本文基于用户提供的文件《{resolved_title}》内容整理，非原发布者新发布观点。"
+        else:
+            note = f"本文基于用户提供文本《{resolved_title}》整理，非原发布者新发布观点。"
+        return {"source_type": resolved_type, "title": resolved_title, "note": note}
+
 
 class XiaohongshuPostGenerator:
     def __init__(self, config: AppConfig, client: LLMClient):
         self.config = config
         self.client = client
 
-    def run(self, cleaned_plain_file: Path, output_dir: Path, metadata: VideoInfo | None) -> dict[str, Path]:
+    def run(
+        self,
+        cleaned_plain_file: Path,
+        output_dir: Path,
+        metadata: VideoInfo | None,
+        source_profile_file: Path | None = None,
+        source_title: str | None = None,
+        source_type: str | None = None,
+    ) -> dict[str, Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
         content = cleaned_plain_file.read_text(encoding="utf-8", errors="ignore")[:20000]
         prompt = self.client.load_prompt(self.config.prompts_root / "xhs/post_generation.md")
 
+        source_context = self._resolve_source_context(source_profile_file, metadata, source_title, source_type)
         outputs: dict[str, Path] = {}
         for idx in range(1, 6):
             p = output_dir / f"xhs_{idx:02d}.md"
@@ -106,7 +143,7 @@ class XiaohongshuPostGenerator:
                 text = self._fallback_post(idx)
             text += (
                 "\n\n---\n"
-                f"来源：基于视频《{metadata.title if metadata else '未知标题'}》转写整理，非原视频作者新发布原文。\n"
+                f"来源：{source_context['note']}\n"
             )
             p.write_text(text, encoding="utf-8")
             outputs[f"xhs_{idx:02d}"] = p
@@ -122,3 +159,28 @@ class XiaohongshuPostGenerator:
             "你最近在执行中最卡的一步是什么？\n"
             "#学习方法 #效率提升 #内容复盘"
         )
+
+    def _resolve_source_context(
+        self,
+        source_profile_file: Path | None,
+        metadata: VideoInfo | None,
+        source_title: str | None,
+        source_type: str | None,
+    ) -> dict[str, str]:
+        profile = {}
+        if source_profile_file and source_profile_file.exists():
+            try:
+                import json
+
+                profile = json.loads(source_profile_file.read_text(encoding="utf-8"))
+            except Exception:
+                profile = {}
+        resolved_type = source_type or profile.get("source_type") or ("video" if metadata else "text")
+        resolved_title = source_title or (metadata.title if metadata else None) or profile.get("title") or "未知标题"
+        if resolved_type == "video":
+            note = f"基于视频《{resolved_title}》转写整理，非原视频作者新发布原文。"
+        elif resolved_type == "file":
+            note = f"基于用户提供文件《{resolved_title}》整理，非原发布者新发布原文。"
+        else:
+            note = f"基于用户提供文本《{resolved_title}》整理，非原发布者新发布原文。"
+        return {"source_type": resolved_type, "title": resolved_title, "note": note}

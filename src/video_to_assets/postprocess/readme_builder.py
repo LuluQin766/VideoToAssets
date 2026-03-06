@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from video_to_assets.pipeline.state import PipelineState
@@ -10,8 +11,18 @@ class VideoReadmeBuilder:
         info = state.metadata
         stages = stage_status.get("stages", {})
         root = state.paths.root
+        source_info = self._load_source_info(root / "source" / "source_info.json")
+        timestamps_present = self._timestamps_present(root)
 
         asset_groups = {
+            "Source & Canonical": [
+                "source/source_info.json",
+                "source/source_info.md",
+                "source/source_snapshot.txt",
+                "normalized/canonical_content.json",
+                "normalized/clean_text.txt",
+                "normalized/structured_text.md",
+            ],
             "Round1 Core": [
                 "metadata/video_info.json",
                 "metadata/video_info.md",
@@ -59,17 +70,28 @@ class VideoReadmeBuilder:
         lines = [
             "# VideoToAssets Asset Index",
             "",
-            f"- video_id: `{state.video_id}`",
-            f"- source_url: {state.url}",
-            f"- title: {info.title if info else 'N/A'}",
-            f"- subtitle_source: {state.subtitle_source}",
-            f"- asr_triggered: {state.asr_triggered}",
-            f"- asr_placeholder: {state.asr_placeholder}",
+            f"- source_id: `{state.source_id or state.video_id}`",
+            f"- source_type: {state.source_type}",
+            f"- input_type: {state.input_type}",
+            f"- source_url: {state.url or 'N/A'}",
+            f"- title: {info.title if info else source_info.get('title', 'N/A')}",
+            f"- source_metadata_complete: {state.source_metadata_complete}",
+            f"- timestamps_present: {timestamps_present}",
             f"- tasks_requested: {', '.join(sorted(state.tasks)) if state.tasks else 'default'}",
             "",
             "## Stage Status",
             "",
         ]
+        if state.input_type == "video":
+            lines.extend(
+                [
+                    f"- subtitle_source: {state.subtitle_source}",
+                    f"- asr_triggered: {state.asr_triggered}",
+                    f"- asr_placeholder: {state.asr_placeholder}",
+                ]
+            )
+        if source_info.get("input_info"):
+            lines.append(f"- input_info: {source_info['input_info']}")
 
         for name, payload in stages.items():
             status = payload.get("status", "unknown")
@@ -92,6 +114,8 @@ class VideoReadmeBuilder:
             [
                 "## Output Folders",
                 "",
+                "- source/",
+                "- normalized/",
                 "- metadata/",
                 "- subtitles_raw/",
                 "- asr/",
@@ -108,3 +132,21 @@ class VideoReadmeBuilder:
         )
 
         output_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _load_source_info(self, path: Path) -> dict:
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _timestamps_present(self, root: Path) -> bool:
+        canonical = root / "normalized" / "canonical_content.json"
+        if canonical.exists():
+            try:
+                payload = json.loads(canonical.read_text(encoding="utf-8"))
+                return bool(payload.get("timestamps"))
+            except Exception:
+                return False
+        return (root / "subtitles_clean" / "cleaned.json").exists()
