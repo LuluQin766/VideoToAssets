@@ -18,35 +18,41 @@ class LLMClient:
 
     def generate(self, prompt: str, content: str, task: str) -> LLMResponse:
         text = content[: self.config.llm_max_input_chars]
+        provider = (self.config.llm_provider or "openai").strip().lower()
 
-        if self._can_call_openai():
+        if provider in {"openai", "qwen", "bailian"}:
             try:
-                return self._call_openai(prompt, text)
+                return self._call_provider(prompt, text, provider)
+            except RuntimeError as exc:
+                if self.logger:
+                    self.logger.warning("%s", exc)
             except Exception as exc:
                 if self.logger:
-                    self.logger.warning("OpenAI call failed, fallback to mock mode: %s", exc)
+                    self.logger.warning("Provider %s call failed, fallback to mock mode: %s", provider, exc)
+        elif self.logger:
+            self.logger.warning("LLM provider '%s' is unsupported", provider)
 
         if not self.config.llm_use_mock_without_api_key:
-            raise RuntimeError("LLM API unavailable and mock disabled")
+            if provider == "qwen":
+                raise RuntimeError("Qwen API unavailable and mock disabled. Configure DASHSCOPE_API_KEY.")
+            if provider == "bailian":
+                env_name = self.config.llm_api_key_env or "BAILIAN_API_KEY"
+                raise RuntimeError(
+                    f"Bailian API unavailable and mock disabled. Configure {env_name} and llm.base_url."
+                )
+            raise RuntimeError("LLM API unavailable and mock disabled. Configure provider API key.")
 
         mock_text = self._mock_response(task, text)
         return LLMResponse(text=mock_text, mode="mock", raw={"task": task, "mock": True})
 
-    def _can_call_openai(self) -> bool:
-        if self.config.llm_provider != "openai":
-            return False
-        if not os.getenv("OPENAI_API_KEY"):
-            return False
-        try:
-            import openai  # noqa: F401
-        except Exception:
-            return False
-        return True
-
-    def _call_openai(self, prompt: str, text: str) -> LLMResponse:
+    def _call_provider(self, prompt: str, text: str, provider: str) -> LLMResponse:
         from openai import OpenAI
 
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        api_key, base_url = self._resolve_provider_credentials(provider)
+        if not api_key:
+            raise RuntimeError(f"Provider {provider} key is missing.")
+
+        client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
         completion = client.chat.completions.create(
             model=self.config.llm_model,
             temperature=self.config.llm_temperature,
@@ -56,8 +62,26 @@ class LLMClient:
             ],
         )
         content = completion.choices[0].message.content or ""
-        raw = completion.model_dump()
-        return LLMResponse(text=content, mode="openai", raw=raw)
+        raw = {
+            "provider": provider,
+            "base_url": base_url,
+            "model": self.config.llm_model,
+            "response": completion.model_dump(),
+        }
+        return LLMResponse(text=content, mode=provider, raw=raw)
+
+    def _resolve_provider_credentials(self, provider: str) -> tuple[str | None, str | None]:
+        provider = provider.strip().lower()
+        if provider == "openai":
+            return os.getenv("OPENAI_API_KEY"), self.config.llm_base_url
+        if provider == "qwen":
+            base_url = self.config.llm_base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            return os.getenv("DASHSCOPE_API_KEY"), base_url
+        if provider == "bailian":
+            env_name = self.config.llm_api_key_env or "BAILIAN_API_KEY"
+            api_key = os.getenv(env_name) or os.getenv("DASHSCOPE_API_KEY")
+            return api_key, self.config.llm_base_url
+        return None, None
 
     def _mock_response(self, task: str, text: str) -> str:
         if task == "quality_review":

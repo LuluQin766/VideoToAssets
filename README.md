@@ -25,6 +25,20 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 ```
+并至少设置：
+```bash
+# Bailian（你给的 coding.dashscope 兼容端点）API Key
+BAILIAN_API_KEY=你的key
+```
+说明：只需要配置一个 Key，取决于 `configs/app.yaml` 里的 `llm.provider`。
+当前默认是 `bailian`，所以只配 `BAILIAN_API_KEY` 即可。
+可选（通常无需改）：
+```bash
+# 若切换到 qwen provider，可用:
+# DASHSCOPE_API_KEY=你的key
+VIDEO_TO_ASSETS_LLM_BASE_URL=https://coding.dashscope.aliyuncs.com/v1
+VIDEO_TO_ASSETS_USE_MOCK_LLM=false
+```
 3. 运行（全量）：
 ```bash
 python scripts/run_single.py --url "https://www.youtube.com/watch?v=VIDEO_ID"
@@ -56,3 +70,11 @@ PYTHONPATH=src python -m video_to_assets.cli run --url "https://www.youtube.com/
 - `source_attribution/`
 - `logs/`
 - `README.md`
+
+## LLM 真实调用校验
+- 质量报告文件 `data/outputs/{video_id}/llm_review/quality_report.md` 首行会显示 `mode`。
+- `mode: bailian` / `mode: qwen` / `mode: openai` 代表已实际调用真实模型。
+- `mode: mock` 代表仍在用本地兜底（通常是 Key 未配置或网络不可达）。
+
+## 安全说明
+`.env` 已在 `.gitignore` 中被忽略，不会被 Git 提交。不要把真实 Key 写进 `.env.example` 或代码里。

@@ -1,3 +1,25 @@
 models:
-  llm_model: gpt-4.1-mini
+  llm_model: qwen3.5-plus
   asr_model: large-v3
+
+providers:
+  bailian:
+    base_url: https://coding.dashscope.aliyuncs.com/v1
+    api_key_env: BAILIAN_API_KEY
+    api: openai-chat-completions
+    models:
+      - id: qwen3-max-2026-01-23
+        name: Snap-最强大脑
+        context_window: 262144
+      - id: qwen3.5-plus
+        name: Snap-全能助手
+        context_window: 131072
+      - id: qwen3-coder-plus
+        name: Snap-编程专家
+        context_window: 131072
+      - id: glm-4.7
+        name: Snap-智谱模型
+        context_window: 128000
+      - id: kimi-k2.5
+        name: Snap-超长上下文
+        context_window: 256000

@@ -24,11 +24,13 @@ asr:
   allow_placeholder_transcript: true
 
 llm:
-  provider: openai
-  model: gpt-4.1-mini
+  provider: bailian
+  model: qwen3.5-plus
+  base_url: https://coding.dashscope.aliyuncs.com/v1
+  api_key_env: BAILIAN_API_KEY
   temperature: 0.2
   max_input_chars: 48000
-  use_mock_without_api_key: true
+  use_mock_without_api_key: false
 
 external_tools:
   yt_dlp_bin: yt-dlp

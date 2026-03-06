@@ -87,6 +87,21 @@ class AppConfig:
         return str(self.raw["llm"].get("model", "gpt-4.1-mini"))
 
     @property
+    def llm_api_key_env(self) -> str | None:
+        value = self.raw["llm"].get("api_key_env")
+        if value:
+            return str(value).strip()
+        return None
+
+    @property
+    def llm_base_url(self) -> str | None:
+        env = os.getenv("VIDEO_TO_ASSETS_LLM_BASE_URL")
+        if env:
+            return env.strip()
+        value = self.raw["llm"].get("base_url")
+        return str(value).strip() if value else None
+
+    @property
     def llm_temperature(self) -> float:
         return float(self.raw["llm"].get("temperature", 0.2))
 
